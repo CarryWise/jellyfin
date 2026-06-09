@@ -232,6 +232,7 @@
  - [MSalman5230](https://github.com/MSalman5230)
  - [dwandw](https://github.com/dwandw)
  - [Lampan-git](https://github.com/Lampan-git)
+ - [Chuck Wagner](https://github.com/CarryWise)
 
 # Emby Contributors
 

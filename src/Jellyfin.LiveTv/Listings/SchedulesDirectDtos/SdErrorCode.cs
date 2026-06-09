@@ -13,9 +13,9 @@ public enum SdErrorCode
     ServiceOffline = 3000,
 
     /// <summary>
-    /// Schedules Direct busy.
+    /// Server is busy processing other requests.
     /// </summary>
-    ServiceBusy = 3001,
+    ServerBusy = 3001,
 
     /// <summary>
     /// Account expired.
@@ -38,9 +38,9 @@ public enum SdErrorCode
     AccountTempLock = 4004,
 
     /// <summary>
-    /// Account permanently locked due to abuse.
+    /// Access to the account via the JSON service has been disabled. Contact Schedules Direct support.
     /// </summary>
-    AccountLocked = 4005,
+    JsonAccessDisabled = 4005,
 
     /// <summary>
     /// Token has expired. Request a new one.
@@ -48,9 +48,9 @@ public enum SdErrorCode
     TokenExpired = 4006,
 
     /// <summary>
-    /// Application locked out.
+    /// Application is not authorized to use the data service.
     /// </summary>
-    AppLocked = 4007,
+    ApplicationDisabled = 4007,
 
     /// <summary>
     /// Account not active.
@@ -68,9 +68,9 @@ public enum SdErrorCode
     MaxIPAttempts = 4010,
 
     /// <summary>
-    /// Lineup change maximum reached.
+    /// Maximum number of lineup changes for today reached.
     /// </summary>
-    MaxScheduleRequests = 4100,
+    MaxLineupChanges = 4100,
 
     /// <summary>
     /// Requested image not found.
@@ -88,7 +88,7 @@ public enum SdErrorCode
     MaxImageDownloadsTrial = 5003,
 
     /// <summary>
-    /// Maximum schedule/metadata requests reached for the day.
+    /// Maximum number of invalid image URIs in 24 hours reached.
     /// </summary>
     MaxInvalidImages = 5004
 }

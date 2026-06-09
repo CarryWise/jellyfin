@@ -38,6 +38,10 @@ namespace Jellyfin.LiveTv.Listings
         private const string ApiUrl = "https://json.schedulesdirect.org/20141201";
         private const int CountryCacheDays = 7;
 
+        // How long to stop contacting SD after a transient failure, to avoid hammering
+        // the service (and tripping its login rate limits).
+        private const int TransientBackoffMinutes = 30;
+
         private readonly ILogger<SchedulesDirect> _logger;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IApplicationPaths _appPaths;
@@ -46,7 +50,7 @@ namespace Jellyfin.LiveTv.Listings
         private readonly ConcurrentDictionary<string, NameValuePair> _tokens = new();
         private readonly JsonSerializerOptions _jsonOptions = JsonDefaults.Options;
         private long _lastErrorResponseTicks;
-        private volatile bool _accountError;
+        private volatile bool _permanentlyDisabled;
         private bool _disposed = false;
 
         private byte[] _countriesCache;
@@ -63,6 +67,7 @@ namespace Jellyfin.LiveTv.Listings
             _appPaths = appPaths;
             _imageLimitHitDate = LoadDailyLimitDate(ImageLimitFilePath);
             _metadataLimitHitDate = LoadDailyLimitDate(MetadataLimitFilePath);
+            _lastErrorResponseTicks = LoadTransientBackoff();
         }
 
         /// <inheritdoc />
@@ -71,6 +76,8 @@ namespace Jellyfin.LiveTv.Listings
         private string ImageLimitFilePath => Path.Combine(_appPaths.CachePath, "sd-image-limit.txt");
 
         private string MetadataLimitFilePath => Path.Combine(_appPaths.CachePath, "sd-metadata-limit.txt");
+
+        private string BackoffFilePath => Path.Combine(_appPaths.CachePath, "sd-backoff.txt");
 
         /// <inheritdoc />
         public string Type => nameof(SchedulesDirect);
@@ -587,14 +594,14 @@ namespace Jellyfin.LiveTv.Listings
                 return null;
             }
 
-            // Permanent account error — SD is disabled for this server lifetime.
-            if (_accountError)
+            // A permanent account/application error has disabled SD for this server lifetime.
+            if (_permanentlyDisabled)
             {
                 return null;
             }
 
             // Avoid hammering SD after transient login failures (e.g. max attempts / temporary lockout)
-            if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastErrorResponseTicks), DateTimeKind.Utc)).TotalMinutes < 30)
+            if (IsInTransientBackoff())
             {
                 return null;
             }
@@ -626,16 +633,27 @@ namespace Jellyfin.LiveTv.Listings
                 }
                 catch (HttpRequestException ex)
                 {
-                    // For 4xx errors not already handled by Request<T>'s SD code logic
-                    // (e.g. unparseable response from the /token endpoint), apply a
-                    // temporary backoff to avoid hammering SD.
-                    if (!_accountError
-                        && ex.StatusCode.HasValue
-                        && (int)ex.StatusCode.Value >= 400
-                        && (int)ex.StatusCode.Value < 500)
+                    // Any token failure that came back from SD (i.e. carries an HTTP status —
+                    // a 4xx/5xx, or a 2xx whose body held an error code) warrants a backoff so
+                    // the per-channel guide refresh doesn't re-authenticate for every channel.
+                    // A null status means a transport/network error, which we don't back off on.
+                    if (!_permanentlyDisabled && ex.StatusCode.HasValue)
                     {
-                        _tokens.Clear();
-                        Interlocked.Exchange(ref _lastErrorResponseTicks, DateTime.UtcNow.Ticks);
+                        SetTransientBackoff();
+                    }
+
+                    throw;
+                }
+                catch (AuthenticationException)
+                {
+                    // GetTokenInternal throws this when the token response is reachable
+                    // (HTTP success) but not "OK" and carries no recognized error code — an
+                    // edge SD can still return. Backing off keeps a token failure from making
+                    // the per-channel guide refresh re-authenticate for every channel (the
+                    // repeated-login pattern SD's rate limits penalize).
+                    if (!_permanentlyDisabled)
+                    {
+                        SetTransientBackoff();
                     }
 
                     throw;
@@ -653,69 +671,67 @@ namespace Jellyfin.LiveTv.Listings
             using var response = await _httpClientFactory.CreateClient(NamedClient.Default)
                 .SendAsync(message, completionOption, cancellationToken)
                 .ConfigureAwait(false);
-            if (response.IsSuccessStatusCode)
-            {
-                return await response.Content.ReadFromJsonAsync<T>(_jsonOptions, cancellationToken).ConfigureAwait(false);
-            }
 
+            // Read the full body first: SD can report failures inside an HTTP 200 response,
+            // so the status code alone can't tell us whether the request succeeded.
             var responseBody = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
 
-            // Try to extract the Schedules Direct error code from the response body.
-            SdErrorCode? sdCode = null;
-            try
+            // Inspect the SD code before trusting the status — a non-zero code is a failure
+            // even on a 200. The raw int drives the success gate; the mapped enum (null for
+            // codes we don't model) drives the classification below.
+            var responseCode = TryGetResponseCode(responseBody);
+            var sdCode = responseCode is int code && Enum.IsDefined((SdErrorCode)code)
+                ? (SdErrorCode)code
+                : (SdErrorCode?)null;
+
+            // Success only when the transport succeeded AND the body carried no error code;
+            // this must run after the code check so a 200-wrapped error isn't deserialized.
+            if (response.IsSuccessStatusCode && responseCode is null)
             {
-                using var doc = JsonDocument.Parse(responseBody);
-                if (doc.RootElement.TryGetProperty("code", out var codeProp)
-                    && codeProp.TryGetInt32(out var parsedCode)
-                    && Enum.IsDefined((SdErrorCode)parsedCode))
+                if (string.IsNullOrWhiteSpace(responseBody))
                 {
-                    sdCode = (SdErrorCode)parsedCode;
+                    return default;
                 }
-            }
-            catch (JsonException)
-            {
-                // Response body is not valid JSON; sdCode stays null.
+
+                return JsonSerializer.Deserialize<T>(responseBody, _jsonOptions);
             }
 
             _logger.LogError(
-                "Request to {Url} failed with HTTP {StatusCode}, SD code {SdCode}: {Response}",
+                "Request to {Url} failed with HTTP {StatusCode}, SD code {SdCode} (raw {ResponseCode}): {Response}",
                 message.RequestUri,
                 (int)response.StatusCode,
-                sdCode?.ToString() ?? "N/A",
+                sdCode?.ToString() ?? "Unknown",
+                responseCode,
                 responseBody);
 
-            if (sdCode is SdErrorCode.AccountExpired or SdErrorCode.InvalidHash or SdErrorCode.InvalidUser or SdErrorCode.AccountLocked or SdErrorCode.AppLocked or SdErrorCode.AccountInactive)
+            if (sdCode is SdErrorCode.AccountExpired or SdErrorCode.InvalidHash or SdErrorCode.InvalidUser or SdErrorCode.JsonAccessDisabled or SdErrorCode.ApplicationDisabled or SdErrorCode.AccountInactive)
             {
-                // Permanent account errors — disable SD for this server lifetime.
+                // Permanent account/application errors — disable SD for this server lifetime.
                 _logger.LogError("Schedules Direct account error (code {SdCode}). Disabling SD until server restart.", sdCode);
                 _tokens.Clear();
-                _accountError = true;
+                _permanentlyDisabled = true;
             }
-            else if (sdCode is SdErrorCode.ServiceOffline or SdErrorCode.ServiceBusy or SdErrorCode.AccountTempLock)
+            else if (sdCode is SdErrorCode.ServiceOffline or SdErrorCode.ServerBusy or SdErrorCode.AccountTempLock)
             {
-                // Transient login errors — back off for 30 minutes, then allow retry.
-                _logger.LogError("Schedules Direct transient error (code {SdCode}). Backing off for 30 minutes.", sdCode);
-                _tokens.Clear();
-                Interlocked.Exchange(ref _lastErrorResponseTicks, DateTime.UtcNow.Ticks);
+                // Transient errors — back off, then allow retry.
+                _logger.LogError("Schedules Direct transient error (code {SdCode}).", sdCode);
+                SetTransientBackoff();
             }
             else if (sdCode is SdErrorCode.MaxLoginAttempts or SdErrorCode.MaxIPAttempts)
             {
                 // 24 hour bans - stop image and metadata requests until SD reset at 00:00 UTC.
+                // These are the per-account/per-IP login bans, so also back off the token
+                // endpoint to stop any further authentication attempts immediately.
                 _logger.LogError("Schedules Direct service limit error (code {SdCode}). Disabling until SD reset.", sdCode);
                 SetImageLimitHit();
                 SetMetadataLimitHit();
+                SetTransientBackoff();
             }
-            else if (sdCode is SdErrorCode.MaxImageDownloads or SdErrorCode.MaxImageDownloadsTrial)
+            else if (sdCode is SdErrorCode.MaxImageDownloads or SdErrorCode.MaxImageDownloadsTrial or SdErrorCode.MaxInvalidImages)
             {
-                // Max image downloads — stop image requests until SD resets at 00:00 UTC.
+                // Image download / invalid-URI limits — stop image requests until SD resets at 00:00 UTC.
                 _logger.LogError("Schedules Direct image download limit hit (code {SdCode}). Disabling image acquisition until SD reset.", sdCode);
                 SetImageLimitHit();
-            }
-            else if (sdCode is SdErrorCode.MaxScheduleRequests)
-            {
-                // Max schedule/metadata requests — stop metadata requests until SD resets at 00:00 UTC.
-                _logger.LogError("Schedules Direct metadata download limit hit (code {SdCode}). Disabling metadata acquisition until SD reset.", sdCode);
-                SetMetadataLimitHit();
             }
             else if (enableRetry
                 && (int)response.StatusCode < 500
@@ -889,18 +905,22 @@ namespace Jellyfin.LiveTv.Listings
         /// <inheritdoc />
         public bool IsServiceAvailable()
         {
-            if (_accountError)
+            if (_permanentlyDisabled)
             {
                 return false;
             }
 
-            if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastErrorResponseTicks), DateTimeKind.Utc)).TotalMinutes < 30)
+            if (IsInTransientBackoff())
             {
                 return false;
             }
 
             return true;
         }
+
+        // True while inside the transient backoff window after a recent SD failure.
+        private bool IsInTransientBackoff()
+            => (DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastErrorResponseTicks), DateTimeKind.Utc)).TotalMinutes < TransientBackoffMinutes;
 
         /// <inheritdoc />
         public bool IsImageDailyLimitActive()
@@ -940,16 +960,18 @@ namespace Jellyfin.LiveTv.Listings
         private void SetImageLimitHit()
         {
             _imageLimitHitDate = DateOnly.FromDateTime(DateTime.UtcNow);
-            PersistDailyLimitFile(ImageLimitFilePath);
+            PersistTimestampFile(ImageLimitFilePath);
         }
 
         private void SetMetadataLimitHit()
         {
             _metadataLimitHitDate = DateOnly.FromDateTime(DateTime.UtcNow);
-            PersistDailyLimitFile(MetadataLimitFilePath);
+            PersistTimestampFile(MetadataLimitFilePath);
         }
 
-        private void PersistDailyLimitFile(string filePath)
+        // Writes the current UTC time to a marker file. Used to persist both the daily
+        // limit dates and the transient backoff window so they survive a restart.
+        private void PersistTimestampFile(string filePath)
         {
             try
             {
@@ -958,8 +980,99 @@ namespace Jellyfin.LiveTv.Listings
             }
             catch (IOException ex)
             {
-                _logger.LogWarning(ex, "Failed to persist SD daily limit to {Path}", filePath);
+                _logger.LogWarning(ex, "Failed to persist SD state to {Path}", filePath);
             }
+        }
+
+        // Records a transient backoff and persists it so the window survives a server
+        // restart, preventing a re-authentication storm on startup (e.g. a crash loop).
+        // If a backoff is already active — e.g. set by another concurrent channel refresh —
+        // this is a no-op, so the file isn't rewritten and the message isn't logged twice.
+        private void SetTransientBackoff()
+        {
+            var now = DateTime.UtcNow.Ticks;
+            var previous = Interlocked.Read(ref _lastErrorResponseTicks);
+
+            // Already within the backoff window: another thread has handled it.
+            if (now - previous < TimeSpan.FromMinutes(TransientBackoffMinutes).Ticks)
+            {
+                return;
+            }
+
+            // Claim the backoff atomically; if another thread won the race, let it do the work.
+            if (Interlocked.CompareExchange(ref _lastErrorResponseTicks, now, previous) != previous)
+            {
+                return;
+            }
+
+            _logger.LogWarning("Backing off Schedules Direct requests for {Minutes} minutes after a transient failure.", TransientBackoffMinutes);
+            _tokens.Clear();
+            PersistTimestampFile(BackoffFilePath);
+        }
+
+        // Restores the transient backoff timestamp from disk, mirroring LoadDailyLimitDate
+        // but using a sliding window (in minutes) rather than a calendar day. Returns the
+        // stored time as UTC ticks if still within the window, otherwise 0 (no backoff).
+        private long LoadTransientBackoff()
+        {
+            var path = BackoffFilePath;
+            if (!File.Exists(path))
+            {
+                return 0;
+            }
+
+            try
+            {
+                var text = File.ReadAllText(path).Trim();
+                if (DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var date))
+                {
+                    var utc = date.ToUniversalTime();
+                    if ((DateTime.UtcNow - utc).TotalMinutes < TransientBackoffMinutes)
+                    {
+                        return utc.Ticks;
+                    }
+                }
+
+                // Expired or unparseable — clean up.
+                TryDeleteFile(path);
+            }
+            catch (IOException)
+            {
+                // Corrupt or unreadable — delete and reset.
+                TryDeleteFile(path);
+            }
+
+            return 0;
+        }
+
+        // Extracts the Schedules Direct response code from a body. SD can return errors in
+        // an HTTP 200 response, so the body must be checked regardless of status. Returns the
+        // raw code for any non-zero value (the modelled SdErrorCode set is only a subset), or
+        // null for success (code 0, a JSON array, or a non-JSON/empty body).
+        private static int? TryGetResponseCode(string responseBody)
+        {
+            if (string.IsNullOrWhiteSpace(responseBody))
+            {
+                return null;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(responseBody);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("code", out var codeProp)
+                    && codeProp.TryGetInt32(out var parsedCode)
+                    && parsedCode != 0)
+                {
+                    return parsedCode;
+                }
+            }
+            catch (JsonException)
+            {
+                // Response body is not valid JSON; treat as no response code.
+            }
+
+            return null;
         }
 
         private static void TryDeleteFile(string path)
